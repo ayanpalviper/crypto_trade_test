@@ -1,0 +1,1 @@
+C:\ProgramData\Anaconda3\envs\crypto_trade\python.exe D:/repository/crypto_trade_back_test/main.py
