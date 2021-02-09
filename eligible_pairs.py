@@ -81,8 +81,11 @@ class capture:
                     if float(df['volume'][idx]) < min_notional * 10000:
                         self.l.log_info("insufficient volume -> "+pair_name)
                         drop = True
+                    else:
+                        self.m.dict_min_notional[pair_name] = min_notional
                 if drop:
                     df.drop(idx, inplace=True)
+
 
             df = df.reset_index()
 
@@ -105,10 +108,10 @@ class capture:
                 except Exception as e:
                     self.l.log_exception('Error Occured')
 
-            self.slack.post_message("eligible pairs successfully captured")
+            #self.slack.post_message("eligible pairs successfully captured")
 
         except:
-            #self.slack.post_message("error occurred in generating eligible pairs")
+            self.slack.post_message("error occurred in generating eligible pairs")
             self.l.log_exception("Error Occurred")
 
 
@@ -140,5 +143,5 @@ class _tikcer():
         sub_df_t = sub_df.tail(1)
         macd_slope = sub_df_t['MACD'].mean() < sub_df_h['MACD'].mean()
         if (sub_df['MACD'].mean() < 0) and (sub_df['MACD_Signal'].mean() < 0) and macd_slope:
-            self.m.store_ticker(df)
+            self.m.store_ticker(pair, df.tail(1))
             df.to_csv("./ticker/" + pair + ".csv")

@@ -1,22 +1,16 @@
 import concurrent.futures
-from datetime import datetime
-from os import listdir
-from os.path import isfile, join
-
-import pandas as pd
-
-from log import log
-from slack_util import slack_util
-from utility import util
+from datetime import datetime, timezone
 
 
 class trade:
 
-    def __init__(self):
-        self.start_time = datetime.now()
-        self.u = util()
-        self.slack = slack_util()
-        self.l = log('trade.py')
+    def __init__(self, m):
+        self.l = m.l
+        self.m = m
+        self.markets_df = m.markets_df
+        self.call = m.call
+        self.slack = m.slack
+        self.dict_ticker_df = m.dict_ticker_df
 
     def get_total_balance(self):
         ret = {}
@@ -30,7 +24,7 @@ class trade:
                         UNION
                         select currency as c, balance as b from balances) as total_bal
                         group by total_bal.c'''
-        results = self.u.execute_sql(statement)
+        results = self.m.execute_sql(statement)
         for result in results:
             ret[result[0]] = result[1]
         return ret
@@ -39,15 +33,11 @@ class trade:
 
         initial_balance_dict = self.get_total_balance()
 
-        onlyfiles = [f for f in listdir("./ticker") if isfile(join("./ticker", f))]
-
-        self.l.log_info('count of files -> ' + str(len(onlyfiles)))
-
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
-            for file in onlyfiles:
-                p = _perform(self.u)
-                futures.append(executor.submit(p.analyse, file))
+            for key in self.dict_ticker_df:
+                p = _perform(self.m, self.l)
+                futures.append(executor.submit(p.analyse, key, self.dict_ticker_df[key]))
             for future in concurrent.futures.as_completed(futures):
                 self.l.log_info(future.result())
 
@@ -58,218 +48,196 @@ class trade:
                 initial_bal = initial_balance_dict[key]
                 final_bal = final_balance_dict[key]
                 perc = ((float(final_bal) - float(initial_bal)) / float(initial_bal)) * 100
-                self.slack.post_message("estimated profit % for " + key + " -> " + str(perc))
+                self.l.log_info("estimated profit % for " + key + " -> " + str(perc))
+                # self.slack.post_message("estimated profit % for " + key + " -> " + str(perc))
 
-        time_diff = datetime.now() - self.start_time
 
-        self.l.log_info('completion took -> %s' % time_diff)
+def rsi_constantly_below_bottom_threshold_since_bought(df, current_index, last_buy_idx):
+    if last_buy_idx is None:
+        return False
+    sub_df = df.loc[last_buy_idx:current_index]
+    for idx in sub_df.index:
+        rsi_below_bottom_threshold = (df['RSI'][idx] < 30) or (0 < (((df['RSI'][idx] - 30) / 30) * 100) < 5)
+        if rsi_below_bottom_threshold:
+            continue
+        else:
+            return False
+    return True
 
 
 class _perform:
 
-    def __init__(self, u):
-        self.u = u
-        self.markets_df = pd.read_json("./json/markets_details.json")
+    def __init__(self, m, l):
+        self.l = l
+        self.m = m
 
-    def computeRSI(self, data, time_window):
-        diff = data.diff(1).dropna()
-        up_chg = 0 * diff
-        down_chg = 0 * diff
-        up_chg[diff > 0] = diff[diff > 0]
-        down_chg[diff < 0] = diff[diff < 0]
-        up_chg_avg = up_chg.ewm(com=time_window - 1, min_periods=time_window).mean()
-        down_chg_avg = down_chg.ewm(com=time_window - 1, min_periods=time_window).mean()
-        rs = abs(up_chg_avg / down_chg_avg)
-        rsi = 100 - 100 / (1 + rs)
-        return rsi
+    def get_balance(self, currency):
+        statement = '''
+            select combo.c as currency, sum(combo.b) as available_bal, sum(combo.tb) as total_bal 
+            from (select currency as c, balance as b, 0 as tb from balances
+                  union
+                  select total_bal.c as c, 0 as b, sum(total_bal.b) as tb from (select t.currency as c, sum(t.total_price) as b
+                    FROM
+                    trade t
+                    where 
+                    t.action = 'BUY'
+                    and t.related = -1
+                    group by t.currency
+                    UNION
+                    select currency as c, balance as b from balances) as total_bal
+                    group by total_bal.c) 
+            as combo
+            where combo.c = %(currency)s
+        ''' % {"currency": "'" + currency + "'"}
+        results = self.m.execute_sql(statement.strip())
+        for result in results:
+            return float(result[1]), float(result[2])
 
-    def stochastic(self, data, k_window, d_window, window):
-        min_val = data.rolling(window=window, center=False).min()
-        max_val = data.rolling(window=window, center=False).max()
-        stoch = ((data - min_val) / (max_val - min_val)) * 100
-        K = stoch.rolling(window=k_window, center=False).mean()
-        D = K.rolling(window=d_window, center=False).mean()
-        return K, D
+    def buy(self, pair, price, currency, timestamp, status, action, buy_amount, str_time):
 
-    def buy(self, pair, price, currency, timestamp, status, action, buy_amount):
+        self.m.acquire_lock()
+
         units = buy_amount / float(price)
+        available_bal, total_bal = self.get_balance(currency)
+        remaining_bal = available_bal - float(buy_amount)
+
         substitution_dict = {
             "pair": "'" + pair + "'",
             "price": price,
             "currency": "'" + currency + "'",
             "unixtime": timestamp,
+            "timestamp": "'" + str_time + "'",
             "status": "'" + status + "'",
             "action": "'" + action + "'",
             "units": "'" + str(units) + "'",
-            "total_price": "'" + str(buy_amount) + "'"
+            "total_price": "'" + str(buy_amount) + "'",
+            "remaining_bal": "'" + str(remaining_bal) + "'"
         }
 
-        statement = "insert into trade (pair, price, units, total_price, currency, unixtime, status, action) values (%(pair)s, %(price)s, %(units)s, %(total_price)s, %(currency)s, %(unixtime)s, " \
-                    "%(status)s, %(action)s)" % substitution_dict
-        self.u.execute_sql(statement, True)
+        statement = "update balances set balance = " + str(remaining_bal) + " where currency = %(currency)s" % substitution_dict
+        self.m.execute_sql(statement, True)
 
-        statement = "select balance from balances where currency = '" + currency + "'"
-        results = self.u.execute_sql(statement)
-        for result in results:
-            buy_price = float(result[0]) - float(buy_amount)
+        statement = "insert into trade (pair, price, units, total_price, currency, unixtime, timestamp, status, action, remaining_bal) " \
+                    "values (%(pair)s, %(price)s, %(units)s, %(total_price)s, %(currency)s, %(unixtime)s, %(timestamp)s, %(status)s, %(action)s, %(remaining_bal)s)" \
+                    % substitution_dict
+        self.m.execute_sql(statement, True)
 
-        statement = "update balances set balance = " + str(buy_price) + " where currency = %(currency)s" % substitution_dict
-        self.u.execute_sql(statement, True)
+        self.m.release_lock()
 
-    def sell(self, pair, price, currency, timestamp, status, action, profit_percent, total_sell_price, total_units):
+    def sell(self, pair, price, currency, timestamp, status, action, str_time):
+
+        self.m.acquire_lock()
+
+        total_buy_price, total_sell_price, total_units, profit_percent = self.calculate_profit(price, pair)
+
+        available_bal, total_bal = self.get_balance(currency)
+        remaining_bal = available_bal + float(total_sell_price)
+
+        total_change = ((total_sell_price - total_buy_price) / remaining_bal) * 100
+
         substitution_dict = {
             "pair": "'" + pair + "'",
             "price": price,
             "currency": "'" + currency + "'",
             "unixtime": timestamp,
+            "timestamp": "'" + str_time + "'",
             "status": "'" + status + "'",
             "action": "'" + action + "'",
-            "profit": "'" + profit_percent + "'",
-            "total_sell_price": "'" + str(total_sell_price) + "'",
-            "total_units": "'" + str(total_units) + "'"
+            "units": "'" + str(total_units) + "'",
+            "total_price": "'" + str(total_sell_price) + "'",
+            "remaining_bal": "'" + str(remaining_bal) + "'",
+            "total_change": "'" + str(total_change) + "'",
+            "profit": "'" + str(profit_percent) + "'"
         }
 
-        statement = "insert into trade (pair, price, units, total_price, currency, unixtime, status, action, profit) values (%(pair)s, %(price)s, %(total_units)s, " \
-                    "%(total_sell_price)s, %(currency)s, %(unixtime)s, %(status)s, %(action)s, %(profit)s)" % substitution_dict
-        self.u.execute_sql(statement, True)
+        statement = "insert into trade (pair, price, units, total_price, currency, unixtime, timestamp, status, action, profit, remaining_bal, total_change) values " \
+                    "(%(pair)s, %(price)s, %(units)s, %(total_price)s, %(currency)s, %(unixtime)s, %(timestamp)s, %(status)s, %(action)s, %(profit)s, %(remaining_bal)s, %(total_change)s)" \
+                    % substitution_dict
+        self.m.execute_sql(statement, True)
 
-        statement = "select balance from balances where currency = '" + currency + "'"
-        results = self.u.execute_sql(statement)
-        for result in results:
-            total_sell_price = float(result[0]) + float(total_sell_price)
+        statement = "update balances set balance = %(remaining_bal)s where currency = %(currency)s" % substitution_dict
+        self.m.execute_sql(statement, True)
 
-        statement = "update balances set balance = " + str(total_sell_price) + " where currency = %(currency)s" % substitution_dict
-        self.u.execute_sql(statement, True)
+        substitution_dict = {
+            "pair": "'" + pair + "'"
+        }
+        statement = "update trade set related = (select id from trade where pair = %(pair)s and action = 'SELL' order by unixtime desc limit 1)" \
+                    " where id in (select id from trade where pair = %(pair)s and action = 'BUY' and related = -1)" % substitution_dict
+        self.m.execute_sql(statement, True)
 
-        statement = "select id from trade where pair = %(pair)s and action = 'SELL' order by unixtime desc limit 1" % {"pair": "'" + pair + "'"}
-        results = self.u.execute_sql(statement, False)
-        id = -1
-        for result in results:
-            id = result[0]
-            break
-
-        statement = "select id from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
-        results = self.u.execute_sql(statement, False)
-        for result in results:
-            substitution_dict = {
-                "related_id": id,
-                "id": result[0]
-            }
-            statement = "update trade set related = %(related_id)s where id = %(id)s" % substitution_dict
-            self.u.execute_sql(statement, True)
+        self.m.release_lock()
 
     def calculate_profit(self, sold_at, pair):
         total_buy_price = 0
         total_units = 0
 
         statement = "select total_price, units from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
-        results = self.u.execute_sql(statement)
+        results = self.m.execute_sql(statement)
 
         for result in results:
             total_buy_price += float(result[0])
             total_units += float(result[1])
         total_sell_price = total_units * sold_at
-        return total_sell_price, total_units, ((total_sell_price - total_buy_price) / total_buy_price) * 100
+        return total_buy_price, total_sell_price, total_units, ((total_sell_price - total_buy_price) / total_buy_price) * 100
 
     def is_already_bought(self, pair):
         count = 0
-        statement = "select count(*) from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
-        results = self.u.execute_sql(statement)
+        last_bought = 0
+        statement = "select count(*), ifnull(max(unixtime), 0) from trade where pair = %(pair)s and action = 'BUY' and related = -1" % {"pair": "'" + pair + "'"}
+        results = self.m.execute_sql(statement)
         for result in results:
             count = int(result[0])
-        return count > 0
-
-    def rsi_constantly_below_bottom_threshold_since_bought(self, df, current_index, last_buy_idx):
-        if last_buy_idx is None:
-            return False
-        sub_df = df.loc[last_buy_idx:current_index]
-        for idx in sub_df.index:
-            rsi_below_bottom_threshold = (df['RSI'][idx] < 30) or (0 < (((df['RSI'][idx] - 30) / 30) * 100) < 5)
-            if rsi_below_bottom_threshold:
-                continue
-            else:
-                return False
-        return True
+            last_bought = int(result[1])
+        return count > 0, last_bought
 
     def cannot_buy(self, currency, price):
         statement = "select balance from balances where currency = '" + currency + "'"
-        results = self.u.execute_sql(statement)
+        results = self.m.execute_sql(statement)
         for result in results:
-            if price >= (float(result[0]) * 2) / 3:
+            if price >= float(result[0]) / 2:
                 return True
         return False
 
-    def get_min_buy_amount(self, pair):
-        df = self.markets_df.loc[self.markets_df['pair'] == pair]
-        return df['min_notional'].values[0]
-
-    def analyse(self, filepath):
-        _l = log(filepath)
+    def analyse(self, pair, df):
         try:
-            df = pd.read_json("./ticker/" + filepath)
-            df = df.sort_index(ascending=False)
-            df = df.reset_index()
-            df = df.drop(columns=['index'])
-            df['RSI'] = self.computeRSI(df['close'], 14)
-            df['K'], df['D'] = self.stochastic(df['RSI'], 3, 3, 14)
-            df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-            df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
-            df['MACD'] = df['MACD'].multiply(1000000)
-            df['MACD_Signal'] = df['MACD_Signal'].multiply(1000000)
-
-            df['Cum_Vol'] = df['volume'].cumsum()
-            df['Cum_Vol_Price'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum()
-            df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
-
-            df = df.drop(columns=['Cum_Vol', 'Cum_Vol_Price'])
-            df = df.tail(287)
-            fp = filepath.replace(".json", "")
-            min_buy_amount = self.get_min_buy_amount(fp)
-            bought = self.is_already_bought(fp)
-            _l.log_info('Already Bought -> ' + str(bought))
-            last_bought = None
-
-            for idx in df.index:
-                rsi_below_bottom_threshold = (df['RSI'][idx] < 30) or (((abs(30 - df['RSI'][idx]) / 30) * 100) < 5)
-                s_rsi_below_threshold_and_blue_below_red = (df['K'][idx] < 20) or ((abs(df['K'][idx] - 20) / 20) * 100) < 5
-                macd_green_below_red = df['MACD'][idx] < df['MACD_Signal'][idx] and abs(((df['MACD_Signal'][idx] - df['MACD'][idx]) / df['MACD'][idx]) * 100) > 5
-                val = datetime.fromtimestamp(int(df['time'][idx] / 1000))
-                val = val.strftime("%Y-%m-%d %H:%M:%S")
+            min_buy_amount = self.m.dict_min_notional[pair]
+            bought, last_bought = self.is_already_bought(pair)
+            self.l.log_info(pair + ' already bought -> ' + str(bought))
+            last_row = df
+            for idx in last_row.index:
+                rsi_below_bottom_threshold = (last_row['RSI'][idx] < 30) or (((abs(30 - last_row['RSI'][idx]) / 30) * 100) < 5)
+                s_rsi_below_threshold_and_blue_below_red = (last_row['K'][idx] < 20) or ((abs(last_row['K'][idx] - 20) / 20) * 100) < 5
+                macd_green_below_red = last_row['MACD'][idx] < last_row['MACD_Signal'][idx] and abs(((last_row['MACD_Signal'][idx] - last_row['MACD'][idx]) / last_row['MACD'][idx]) * 100) > 5
+                str_time = datetime.fromtimestamp(int(last_row['time'][idx] / 1000)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 if rsi_below_bottom_threshold and s_rsi_below_threshold_and_blue_below_red and macd_green_below_red:
 
-                    bought_for = df['close'][idx]
+                    bought_for = last_row['close'][idx]
 
-                    if self.cannot_buy(fp.split("_")[1], min_buy_amount):
-                        _l.log_info('insufficient balance at ' + val)
+                    if self.cannot_buy(pair.split("_")[1], min_buy_amount):
+                        self.l.log_info(pair + ' insufficient balance at ' + str_time)
                         continue
-                    if self.rsi_constantly_below_bottom_threshold_since_bought(df, idx, last_bought):
-                        _l.log_info('rsi_constantly_below_bottom_threshold_since_bought')
-                        continue
-                    if last_bought is not None and ((df['time'][idx] - df['time'][last_bought]) <= 900000):
-                        _l.log_info('Already bought in the last 15 mins')
+                    if last_bought != 0 and ((last_row['time'][idx] - last_bought) <= 900000):
+                        self.l.log_info(pair + ' has been bought in the last 15 mins')
                         continue
 
-                    _l.log_info('buying at ' + val)
+                    self.l.log_info(pair + ' buying at ' + str_time)
                     bought = True
-                    self.buy(fp, bought_for, fp.split("_")[1], df['time'][idx], "DONE", "BUY", min_buy_amount)
+                    self.buy(pair, bought_for, pair.split("_")[1], last_row['time'][idx], "DONE", "BUY", min_buy_amount, str_time)
                     last_bought = idx
                     continue
 
                 if bought:
-                    rsi_above_top_threshold = (df['RSI'][idx] > 70) and ((((df['RSI'][idx] - 70) / 70) * 100) > 5)
-                    s_rsi_above_top_threshold = (df['K'][idx] > 80) and (((df['K'][idx] - 80) / 80) * 100) > 5
-                    macd_green_above_red = df['MACD'][idx] > df['MACD_Signal'][idx] and abs(((df['MACD_Signal'][idx] - df['MACD'][idx]) / df['MACD'][idx]) * 100) > 5
+                    rsi_above_top_threshold = (last_row['RSI'][idx] > 70) and ((((last_row['RSI'][idx] - 70) / 70) * 100) > 5)
+                    s_rsi_above_top_threshold = (last_row['K'][idx] > 80) and (((last_row['K'][idx] - 80) / 80) * 100) > 5
+                    macd_green_above_red = last_row['MACD'][idx] > last_row['MACD_Signal'][idx] and abs(((last_row['MACD_Signal'][idx] - last_row['MACD'][idx]) / last_row['MACD'][idx]) * 100) > 5
 
                     if rsi_above_top_threshold and s_rsi_above_top_threshold and macd_green_above_red:
-                        _l.log_info('sold at' + val)
-                        sold_for = df['close'][idx]
-                        total_sell_price, total_units, profit_percent = self.calculate_profit(sold_for, fp)
+                        self.l.log_info(pair + ' sold at' + str_time)
+                        sold_for = last_row['close'][idx]
                         bought = False
-                        self.sell(fp, sold_for, fp.split("_")[1], df['time'][idx], 'DONE', 'SELL', str(profit_percent), total_sell_price, total_units)
+                        self.sell(pair, sold_for, pair.split("_")[1], last_row['time'][idx], 'DONE', 'SELL', str_time)
 
-            if bought:
-                _l.log_info("remains unsold at EOD")
-            return "completed " + filepath
+            return "completed " + pair
 
         except:
-            _l.log_exception('Error Occurred')
+            self.l.log_exception('Error Occurred ' + pair)

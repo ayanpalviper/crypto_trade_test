@@ -3,7 +3,7 @@ import os
 import sqlite3 as sql
 import threading
 from datetime import date, datetime, timedelta
-from threading import Lock
+from threading import RLock
 from time import sleep
 
 import pandas as pd
@@ -30,11 +30,15 @@ def get_date_as_ms_string(days_delta):
     return dt[:dt.index('.')]
 
 
+def store_json(df, path):
+    df.to_json(path)
+
+
 class master:
 
     def __init__(self):
         self.l = log()
-        self.lock = Lock()
+        self.lock = RLock()
         self.env = load_env()
 
         self.slack = slack_util(self.l, self.env)
@@ -43,26 +47,22 @@ class master:
 
         self._created_threads = []
         self.markets_df = None
-        self.ls_ticker_df = []
+        self.dict_ticker_df = {}
+        self.dict_min_notional = {}
         self.l.log_info('MASTER INIT COMPLETE')
 
-
     # PRIVATE METHODS - START
-
-    def _store_json(self, df):
-        df.to_json(self.env.get_value('BASE_PATH') + self.env.get_value('USABLE_MARKET_DETAILS_PATH'))
 
     # PRIVATE METHODS - END
 
     def acquire_lock(self):
-        while self.lock.locked():
-            self.l.log_debug("locked")
-            sleep(0.5)
+        self.l.log_debug('attempting to acquire lock')
         self.lock.acquire(blocking=True)
+        self.l.log_debug('lock acquired')
 
     def release_lock(self):
-        if self.lock.locked():
-            self.lock.release()
+        self.lock.release()
+        self.l.log_debug('lock released')
 
     def join_threads(self):
         for thread in self._created_threads:
@@ -80,10 +80,11 @@ class master:
 
     def init_markets_df(self):
 
-        path = self.env.get_value('BASE_PATH') + self.env.get_value('MARKET_DETAILS_PATH')
+        umd_path = self.env.get_value('BASE_PATH') + self.env.get_value('USABLE_MARKET_DETAILS_PATH')
+        md_path = self.env.get_value('BASE_PATH') + self.env.get_value('MARKET_DETAILS_PATH')
 
         try:
-            mtime = os.path.getmtime(path)
+            mtime = os.path.getmtime(umd_path)
             val = datetime.fromtimestamp(int(mtime))
             last_access_date = val.strftime("%Y-%m-%d")
         except FileNotFoundError as f:
@@ -92,14 +93,14 @@ class master:
         current_date = datetime.today().strftime('%Y-%m-%d')
 
         if current_date == last_access_date:
-            df = pd.read_json(path)
+            self.markets_df = pd.read_json(umd_path)
+            return self.markets_df
         else:
             df = self.call.get_active_market_details()
-            df.to_json(path)
+            self.run_thread("store_market_details", store_json, [df, md_path])
+            df.to_json(md_path)
 
         base_currency_list = self.env.get_value('BASE_CURR_LIST').split(',')
-
-        user_balance_df = self.call.get_user_balances()
 
         for idx in df.index:
             base_currency_short_name = df['base_currency_short_name'][idx]
@@ -107,23 +108,14 @@ class master:
                 df.drop(idx, inplace=True)
             else:
                 drop = False
-                if base_currency_short_name not in user_balance_df.currency.values:
-                    df.drop(idx, inplace=True, errors="ignore")
-                    continue
-                index = user_balance_df[user_balance_df['currency'] == base_currency_short_name].index
-                bal = user_balance_df['balance'][index].values[0] + user_balance_df['locked_balance'][index].values[0]
                 min_notional = float(df['min_notional'][idx])
-                '''
-                if float(bal / 5) < float(df['min_notional'][idx]):
-                    drop = True
-                '''
                 step = df['step'][idx]
                 if step / min_notional > 100:
                     drop = True
                 if drop:
                     df.drop(idx, inplace=True, errors="ignore")
         self.markets_df = df
-        self.run_thread("store_usable_market_details", self._store_json, [df])
+        self.run_thread("store_usable_market_details", store_json, [df, umd_path])
         return df
 
     def execute_sql(self, statement, commit=False, db='./db/buy_sell_test.db'):
@@ -153,5 +145,5 @@ class master:
         self.release_lock()
         return ls_results
 
-    def store_ticker(self, df):
-        self.ls_ticker_df.append(df)
+    def store_ticker(self, pair, df):
+        self.dict_ticker_df[pair] = df

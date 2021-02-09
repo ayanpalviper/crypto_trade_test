@@ -1,6 +1,7 @@
 from master import master
 from time import sleep
 from eligible_pairs import capture
+from trade import trade
 
 from datetime import datetime
 
@@ -47,6 +48,8 @@ m.init_markets_df()
 ep = capture(m)
 ep.do()
 
+t = trade(m)
+t.do()
 
 time_diff = datetime.now() - start_time
 m.l.log_info('main completion took -> %s' % time_diff)
