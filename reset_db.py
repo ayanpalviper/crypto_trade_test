@@ -1,6 +1,3 @@
-from coindcx_api_caller import call_api
-from log import log
-from slack_util import slack_util
 from master import master
 
 
@@ -27,6 +24,6 @@ class reset:
 
 
 if __name__ == "__main__":
-    m = master()
+    m = master(None)
     r = reset(m)
     r.do()

@@ -1,72 +1,32 @@
-from master import master
-from time import sleep
-from eligible_pairs import capture
-from trade import trade
-
 from datetime import datetime
 
-'''
+from eligible_pairs import capture
+from log import log
+from master import master
+from trade import trade
+
 l = log()
 l.log_info('***********START***********')
 
-with open('last.txt', 'r') as f:
-    s = f.read()
-    date_object = date.today()
-    if s.strip() == str(date_object):
-        l.log_info('has already run today')
-        sys.exit()
-
-
-slack = slack_util()
-
-
-def connect(host='http://facebook.com'):
-    try:
-        urllib.request.urlopen(host, timeout=10)
-        return True
-    except:
-        return False
-
-
-count = 0
-
-while not connect():
-    if count >= 10:
-        slack.post_message("No Internet. Maximum retry exceeded, please run script manually")
-        l.log_error("Maximum retry exceeded, please run script manually")
-        sys.exit()
-    l.log_warn("No Internet Connection")
-    sleep(600)
-    count += 1
-
-'''
 start_time = datetime.now()
 
-m = master()
+m = master(l)
 m.init_markets_df()
 
 ep = capture(m)
 ep.do()
 
+print(m.dict_ticker_df['B-EGLD_USDT'])
+
+'''
 t = trade(m)
 t.do()
 
 time_diff = datetime.now() - start_time
-m.l.log_info('main completion took -> %s' % time_diff)
-
+l.log_info('processing completion took -> %s' % time_diff)
 '''
-sleep(5)
 
-t = trade()
-t.do()
-
-date_object = date.today()
-with open('last.txt', 'w') as f:
-    print(date_object, file=f)
-
-l.log_info('***********END***********')
-
-'''
+time_diff = datetime.now() - start_time
+l.log_info('***********END***********  ' + 'script completion took -> %s' % time_diff)
 
 m.join_threads()
-

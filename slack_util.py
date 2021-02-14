@@ -9,5 +9,9 @@ class slack_util:
         self._channel = "coindcx-bot-status-updates"
 
     def post_message(self, message):
-        self._client.chat_postMessage(channel=self._channel, text=message)
-        self.log.log_info('Posted message to Slack -> ' + message)
+        try:
+            self._client.chat_postMessage(channel=self._channel, text=message)
+            self.log.log_info('Posted message to Slack -> ' + message)
+        except:
+            self.log.log_exception('Error Occured')
+            pass

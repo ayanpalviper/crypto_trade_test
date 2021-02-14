@@ -1,8 +1,14 @@
+import asyncio
 import concurrent.futures
 import glob
 import os
 
 import numpy as np
+from aiohttp import ClientSession
+from pandas import json_normalize
+
+import json
+from datetime import datetime
 
 
 def computeRSI(data, time_window):
@@ -38,7 +44,7 @@ class capture:
 
     def clear_tmp(self):
         self.l.log_info('clearing previous ticker json')
-        files = glob.glob('./ticker/*.csv')
+        files = glob.glob(os.path.realpath('.') + '/ticker/*.csv')
         for f in files:
             try:
                 os.remove(f)
@@ -55,8 +61,55 @@ class capture:
             ls_unsold.append(result[0])
         return ls_unsold
 
-    def do(self):
+    async def run(self, ls_pairs, ls_unsold):
+        tasks = []
 
+        # Fetch all responses within one Client session,
+        # keep connection alive for all requests.
+        async with ClientSession() as session:
+            for pair in ls_pairs:
+                url = self.call.get_candle_url(pair, '5m')
+                task = asyncio.ensure_future(self.fetch(pair, url, session))
+                tasks.append(task)
+
+            responses = await asyncio.gather(*tasks)
+            # you now have all response bodies in this variable
+            self.l.log_debug('Responses Gathered -> ' + str(len(responses)))
+            '''
+            for response in responses:
+                p = response[0]
+                pair_json = response[1]
+                ticker = _tikcer(self.call, self.m)
+                ticker.fetch(p, pair_json, p in ls_unsold)
+
+            '''
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = []
+                try:
+                    for response in responses:
+                        p = response[0]
+                        pair_json = response[1]
+                        my_json = pair_json.decode('utf-8').replace("'", '"')
+                        data = json.loads(my_json)
+                        df = json_normalize(data)
+                        ticker = _tikcer(self.call, self.m, self.l)
+                        futures.append(executor.submit(ticker.fetch, p, df, p in ls_unsold))
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+                except:
+                    self.l.log_exception('Error Occured')
+
+            self.l.log_debug('Candle data formatted')
+
+
+    async def fetch(self, pair, url, session):
+        self.l.log_debug(url)
+        async with session.get(url) as response:
+            res = await response.read()
+            return [pair, res]
+
+    def do(self):
+        loop = asyncio.get_event_loop()
         try:
 
             self.clear_tmp()
@@ -78,70 +131,60 @@ class capture:
                     pair_name = markets_df['pair'][index].values[0]
                     min_notional = markets_df['min_notional'][index].values[0]
                     df.loc[idx, 'pair_name'] = pair_name
+                    self.m.dict_min_notional[pair_name] = min_notional
                     if float(df['volume'][idx]) < min_notional * 10000:
-                        self.l.log_info("insufficient volume -> "+pair_name)
+                        self.l.log_info("insufficient volume -> " + pair_name)
                         drop = True
-                    else:
-                        self.m.dict_min_notional[pair_name] = min_notional
                 if drop:
                     df.drop(idx, inplace=True)
 
-
-            df = df.reset_index()
-
             ls_pairs = df['pair_name'].tolist()
 
-            ls_pairs.extend(self.get_unsold())
+            ls_unsold = self.get_unsold()
+
+            ls_pairs.extend(ls_unsold)
 
             ls_pairs = set(ls_pairs)
 
             self.l.log_info(len(ls_pairs))
 
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = []
-                try:
-                    for pair in ls_pairs:
-                        ticker = _tikcer(self.call, self.m)
-                        futures.append(executor.submit(ticker.fetch, pair))
-                    for future in concurrent.futures.as_completed(futures):
-                        future.result()
-                except Exception as e:
-                    self.l.log_exception('Error Occured')
+            future = asyncio.ensure_future(self.run(ls_pairs, ls_unsold))
+            loop.run_until_complete(future)
 
-            #self.slack.post_message("eligible pairs successfully captured")
+            # self.slack.post_message("eligible pairs successfully captured")
+            self.l.log_debug('Eligible Pair Completion')
 
         except:
-            self.slack.post_message("error occurred in generating eligible pairs")
+            # self.slack.post_message("error occurred in generating eligible pairs")
             self.l.log_exception("Error Occurred")
 
 
 class _tikcer():
 
-    def __init__(self, call, m):
+    def __init__(self, call, m, l):
         self.call = call
         self.m = m
 
-    def fetch(self, pair):
-        df = self.call.get_candle_data(pair, '5m')
+    def fetch(self, pair, df, is_unsold):
+        add_ticker = False
         df = df.sort_index(ascending=False)
-        df = df.reset_index()
-        df = df.drop(columns=['index'])
         df['RSI'] = computeRSI(df['close'], 14)
         df['K'], df['D'] = stochastic(df['RSI'], 3, 3, 14)
         df['MACD'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
         df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
         df['MACD'] = df['MACD'].multiply(1000000)
         df['MACD_Signal'] = df['MACD_Signal'].multiply(1000000)
-        df['Cum_Vol'] = df['volume'].cumsum()
-        df['Cum_Vol_Price'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum()
-        df['VWAP'] = df['Cum_Vol_Price'] / df['Cum_Vol']
-        df = df.drop(columns=['Cum_Vol', 'Cum_Vol_Price'])
-        df = df.dropna()
-        df = df.reset_index()
+        #df = df.dropna()
         sub_df = df.tail(6)
         sub_df_h = sub_df.head(1)
         sub_df_t = sub_df.tail(1)
         macd_slope = sub_df_t['MACD'].mean() < sub_df_h['MACD'].mean()
+        if is_unsold:
+            add_ticker = True
         if (sub_df['MACD'].mean() < 0) and (sub_df['MACD_Signal'].mean() < 0) and macd_slope:
-            self.m.store_ticker(pair, df.tail(1))
-            df.to_csv("./ticker/" + pair + ".csv")
+            add_ticker = True
+        if add_ticker:
+            df.to_csv(os.path.realpath('.') + "/ticker/" + pair + ".csv")
+            df = df.iloc[[len(df) - 2]]
+            self.m.store_ticker(pair, df)
+            #df.to_csv(os.path.realpath('.') + "/ticker/" + pair + ".csv")

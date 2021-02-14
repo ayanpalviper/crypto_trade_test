@@ -28,6 +28,7 @@ class call_api():
         self._cancel_order = "https://api.coindcx.com/exchange/v1/orders/cancel"
         self._order_status = "https://api.coindcx.com/exchange/v1/orders/status"
         self._multiple_order_status = "https://api.coindcx.com/exchange/v1/orders/status_multiple"
+        self._trade_history = "https://api.coindcx.com/exchange/v1/orders/trade_history"
         self._url_separator = "&"
 
     def _call(self, url, body=None):
@@ -112,6 +113,11 @@ class call_api():
         self._log.log_info('get_ticker completion took -> %s' % time_diff)
         return json_normalize(data)
 
+    def get_current_price(self, market):
+        df = self.get_ticker()
+        df = df.loc[df['market'] == market]
+        return df['last_price'].values[0]
+
     def get_all_market_details(self):
         start_time = datetime.now()
         self._log.log_info("get_all_market_details method execution started")
@@ -145,9 +151,17 @@ class call_api():
         interval_url = "interval=" + str(interval)
         limit_url = "limit=" + str(limit)
         full_url = self._candle_base_url + pair_url + self._url_separator + interval_url + self._url_separator + limit_url
+
         response = requests.get(full_url)
         data = response.json()
         return json_normalize(data)
+
+    def get_candle_url(self, pair_name, interval, limit=500):
+        pair_url = "pair=" + pair_name
+        interval_url = "interval=" + str(interval)
+        limit_url = "limit=" + str(limit)
+        full_url = self._candle_base_url + pair_url + self._url_separator + interval_url + self._url_separator + limit_url
+        return full_url
 
     def get_candle_data_by_time_frame(self, pair_name, interval, start, end):
         pair_url = "pair=" + pair_name
@@ -215,3 +229,14 @@ class call_api():
         data = response.json()
         df = json_normalize(data)
         pass
+
+    def get_trade_history(self):
+        time_stamp = int(round(time.time() * 1000))
+        body = {
+            "limit": 1000,
+            "timestamp": time_stamp
+        }
+        response = self._call(self._trade_history, body)
+        data = response.json()
+        df = json_normalize(data)
+        return df

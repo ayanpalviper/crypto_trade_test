@@ -2,7 +2,6 @@ import concurrent.futures
 from datetime import datetime, timezone
 
 
-
 def rsi_constantly_below_bottom_threshold_since_bought(df, current_index, last_buy_idx):
     if last_buy_idx is None:
         return False
@@ -71,22 +70,12 @@ class _perform:
         df = self.markets_df.loc[self.markets_df['pair'] == pair]
         return df['coindcx_name'].values[0]
 
-    def buy(self, pair, currency, timestamp, status, action, buy_amount, str_time, is_bought):
+    def buy(self, pair, currency, timestamp, status, action, buy_amount, str_time):
         self.m.acquire_lock()
         try:
-            available_bal, total_bal = self.get_balance(currency)
-            ret = False
-            if is_bought:
-                if buy_amount >= available_bal / 2:
-                    ret = True
-            else:
-                if buy_amount >= (available_bal * 2) / 3:
-                    ret = True
-            if ret:
-                self.l.log_info(pair + ' insufficient balance ' + str_time)
-                return
             price = self.call.get_current_price(self.get_coindcx_name(pair))
             units = buy_amount / float(price)
+            available_bal, total_bal = self.get_balance(currency)
             remaining_bal = available_bal - float(buy_amount)
 
             substitution_dict = {
@@ -109,9 +98,8 @@ class _perform:
                         "values (%(pair)s, %(price)s, %(units)s, %(total_price)s, %(currency)s, %(unixtime)s, %(timestamp)s, %(status)s, %(action)s, %(remaining_bal)s)" \
                         % substitution_dict
             self.m.execute_sql(statement, True)
-            self.l.log_info(pair + ' buying at ' + str_time)
         except:
-            self.l.log_exception('error while buying -> ' + pair)
+            self.l.log_exception('error while buying -> '+pair)
         finally:
             self.m.release_lock()
 
@@ -155,9 +143,8 @@ class _perform:
             statement = "update trade set related = (select id from trade where pair = %(pair)s and action = 'SELL' order by unixtime desc limit 1)" \
                         " where id in (select id from trade where pair = %(pair)s and action = 'BUY' and related = -1)" % substitution_dict
             self.m.execute_sql(statement, True)
-            self.l.log_info(pair + ' sold at ' + str_time)
         except:
-            self.l.log_exception('error while buying -> ' + pair)
+            self.l.log_exception('error while buying -> '+pair)
         finally:
             self.m.release_lock()
 
@@ -184,6 +171,14 @@ class _perform:
             last_bought = int(result[1])
         return count > 0, last_bought
 
+    def cannot_buy(self, currency, price):
+        statement = "select balance from balances where currency = '" + currency + "'"
+        results = self.m.execute_sql(statement)
+        for result in results:
+            if price >= float(result[0]) / 2:
+                return True
+        return False
+
     def analyse(self, pair, df):
         try:
             min_buy_amount = self.m.dict_min_notional[pair]
@@ -197,11 +192,16 @@ class _perform:
                 str_time = datetime.fromtimestamp(int(last_row['time'][idx] / 1000)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
                 if rsi_below_bottom_threshold and s_rsi_below_threshold_and_blue_below_red and macd_green_below_red:
+
+                    if self.cannot_buy(pair.split("_")[1], min_buy_amount):
+                        self.l.log_info(pair + ' insufficient balance at ' + str_time)
+                        continue
                     if last_bought != 0 and ((last_row['time'][idx] - last_bought) <= 900000):
                         self.l.log_info(pair + ' has been bought in the last 15 mins')
                         continue
 
-                    self.buy(pair, pair.split("_")[1], last_row['time'][idx], "DONE", "BUY", min_buy_amount, str_time, bought)
+                    self.l.log_info(pair + ' buying at ' + str_time)
+                    self.buy(pair, pair.split("_")[1], last_row['time'][idx], "DONE", "BUY", min_buy_amount, str_time)
                     continue
 
                 if bought:
@@ -210,6 +210,7 @@ class _perform:
                     macd_green_above_red = last_row['MACD'][idx] > last_row['MACD_Signal'][idx] and abs(((last_row['MACD_Signal'][idx] - last_row['MACD'][idx]) / last_row['MACD'][idx]) * 100) > 5
 
                     if rsi_above_top_threshold and s_rsi_above_top_threshold and macd_green_above_red:
+                        self.l.log_info(pair + ' sold at ' + str_time)
                         self.sell(pair, pair.split("_")[1], last_row['time'][idx], 'DONE', 'SELL', str_time)
 
             return "completed " + pair
